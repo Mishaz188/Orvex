@@ -1,0 +1,13 @@
+vosk
+sounddevice
+pyttsx3
+requests
+pyautogui
+psutil
+pyperclip
+flask
+mss
+pillow
+qrcode
+edge-tts
+comtypes; sys_platform == "win32"
