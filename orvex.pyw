@@ -15,7 +15,7 @@ HERE = Path(__file__).parent.resolve()
 os.chdir(HERE)
 sys.path.insert(0, str(HERE))
 
-NEEDED = {"vosk": "vosk", "sounddevice": "sounddevice", "pyttsx3": "pyttsx3", "requests": "requests",
+NEEDED = {"faster_whisper": "faster-whisper", "numpy": "numpy", "sounddevice": "sounddevice", "pyttsx3": "pyttsx3", "requests": "requests",
           "pyautogui": "pyautogui", "psutil": "psutil", "pyperclip": "pyperclip", "flask": "flask",
           "mss": "mss", "PIL": "pillow", "qrcode": "qrcode", "edge_tts": "edge-tts"}
 

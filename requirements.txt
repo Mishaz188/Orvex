@@ -1,6 +1,8 @@
-vosk
+faster-whisper
+numpy
 sounddevice
 pyttsx3
+comtypes; sys_platform == "win32"
 requests
 pyautogui
 psutil
@@ -10,4 +12,3 @@ mss
 pillow
 qrcode
 edge-tts
-comtypes; sys_platform == "win32"

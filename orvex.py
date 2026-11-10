@@ -4,7 +4,7 @@
 Orvex — голосовий помічник для ноутбука.
 
 * Активація: «Орвекс, …». Вимкнення: «Орвекс, вихід».
-* Розпізнавання мови — Vosk (офлайн). Голос — онлайн-голос Microsoft (edge-tts), запасний — локальний голос Windows.
+* Розпізнавання мови — Whisper (офлайн, faster-whisper). Голос — онлайн-голос Microsoft (edge-tts), запасний — локальний голос Windows.
 * Без інтернету працюють: відкриття програм, сайтів, папок, звук, скріншоти, нотатки, гарячі клавіші, час.
 * З інтернетом: пошук Google, Вікіпедія. З ключем ШІ (Claude, ChatGPT або Gemini): відповіді на будь-що
   і агент, який сам складає й виконує план дій (вікна, друк, вкладки Chrome).
@@ -28,7 +28,6 @@ import threading
 import time
 import urllib.parse
 import webbrowser
-import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -37,8 +36,9 @@ import requests
 from orvex_state import STATE
 
 try:
+    import numpy as np
     import sounddevice as sd
-    from vosk import KaldiRecognizer, Model, SetLogLevel
+    from faster_whisper import WhisperModel
 except ImportError:
     print("Встанови залежності:  pip install -r requirements.txt")
     sys.exit(1)
@@ -67,11 +67,7 @@ PLUGINS = BASE / "plugins"
 DATA.mkdir(exist_ok=True)
 PLUGINS.mkdir(exist_ok=True)
 
-MODEL_NAME = "vosk-model-small-uk-v3-small"
-MODEL_URL = f"https://alphacephei.com/vosk/models/{MODEL_NAME}.zip"
-MODEL_DIR = DATA / MODEL_NAME
-
-WAKE_WORDS = ["орвекс", "орвех", "orvex", "арвекс", "орвеск", "орвєкс", "ормекс", "орлик"]
+WAKE_WORDS = ["орвекс", "орвех", "orvex", "арвекс", "орвеск", "орвєкс", "ормекс", "орлик", "орбекс", "орвікс", "оврекс"]
 EXIT_WORDS = ["вихід", "вийди", "вийти", "вимкнись", "вимкнися", "до побачення", "exit"]
 ACTIVE_WINDOW = 8          # секунд після відповіді, коли можна говорити без wake word
 SAMPLE_RATE = 16000
@@ -79,7 +75,8 @@ OS = platform.system()     # Windows / Darwin / Linux
 
 CONFIG_FILE = DATA / "config.json"
 CONFIG_TEMPLATE = {"ai_provider": "", "anthropic_api_key": "", "openai_api_key": "", "gemini_api_key": "",
-                   "cloudflare_token": "", "public_url": "", "edge_voice": "uk-UA-OstapNeural", "tts_rate": "+0%"}
+                   "cloudflare_token": "", "public_url": "", "whisper_model": "small",
+                   "edge_voice": "uk-UA-OstapNeural", "tts_rate": "+0%"}
 
 
 def _load_config():
@@ -104,6 +101,7 @@ def _load_config():
 
 
 _cfg, _raw, CONFIG_ERROR = _load_config()
+
 # --- ШІ-провайдери: Claude (anthropic), ChatGPT (openai), Gemini (gemini) ---
 PROVIDERS = {
     "anthropic": {"name": "Claude", "key": "anthropic_api_key", "env": "ANTHROPIC_API_KEY",
@@ -436,42 +434,33 @@ class Voice:
 
 
 # --------------------------------------------------------------------------- #
-#  Голос: вхід (Vosk, офлайн)
+#  Голос: вхід (Whisper, офлайн)
 # --------------------------------------------------------------------------- #
-def ensure_model():
-    if MODEL_DIR.exists():
-        return MODEL_DIR
-    print("Завантажую українську модель розпізнавання (~70 МБ, один раз)...")
-    zip_path = DATA / "model.zip"
-    try:
-        with requests.get(MODEL_URL, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            with open(zip_path, "wb") as f:
-                for chunk in r.iter_content(1 << 20):
-                    f.write(chunk)
-        with zipfile.ZipFile(zip_path) as z:
-            z.extractall(DATA)
-        zip_path.unlink(missing_ok=True)
-    except Exception as e:
-        print(f"Не вдалось завантажити модель: {e}")
-        print(f"Скачай вручну {MODEL_URL} і розпакуй у {DATA}")
-        sys.exit(1)
-    return MODEL_DIR
-
-
 class Listener:
-    def __init__(self, voice):
-        SetLogLevel(-1)
+    """Мікрофон + розпізнавання Whisper (faster-whisper), працює без інтернету.
+    Фраза вирізається за гучністю: пауза ~0.75 с закінчує її, далі вона розпізнається цілком."""
+    HALLUCINATIONS = ("дякую за перегляд", "субтитр", "продовження наст", "підписуйтесь", "до побачення всім")
+
+    def __init__(self, voice, hints=None):
         self.voice = voice
-        self.model = Model(str(ensure_model()))
-        self.rec = KaldiRecognizer(self.model, SAMPLE_RATE)
+        self.hints = hints or (lambda: [])
         self.q = queue.Queue()
+        name = str(_cfg.get("whisper_model") or "small")
+        print(f"Завантажую модель Whisper «{name}» (перший раз довго: кілька сотень МБ)...")
+        STATE["mode"] = "thinking"
+        self.model = WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=min(8, os.cpu_count() or 4))
+        self.floor = 150.0              # рівень фонового шуму (оновлюється сам)
+        self._reset()
         self.stream = sd.RawInputStream(
-            samplerate=SAMPLE_RATE, blocksize=4000, dtype="int16",
-            channels=1, callback=self._cb)
+            samplerate=SAMPLE_RATE, blocksize=4000, dtype="int16", channels=1, callback=self._cb)
+        print("Whisper готовий.")
+
+    def _reset(self):
+        self.pre = []                   # кілька блоків перед початком мови, щоб не обрізати перше слово
+        self.seg, self.quiet, self.loud = [], 0, 0
 
     def _cb(self, indata, frames, t, status):
-        if not self.voice.speaking:       # не слухаємо самого себе
+        if not self.voice.speaking:     # не слухаємо самого себе
             b = bytes(indata)
             self.q.put(b)
             try:
@@ -489,27 +478,73 @@ class Listener:
         self.stream.stop()
         self.stream.close()
 
-    def listen(self, timeout=None):
-        """Повертає наступну розпізнану фразу (рядок) або None за таймаутом."""
-        end = time.time() + timeout if timeout else None
-        while True:
-            if end and time.time() > end:
-                return None
-            try:
-                data = self.q.get(timeout=0.3)
-            except queue.Empty:
-                continue
-            if self.rec.AcceptWaveform(data):
-                text = json.loads(self.rec.Result()).get("text", "").strip()
-                if text:
-                    return text
-
     def flush(self):
         while not self.q.empty():
             try:
                 self.q.get_nowait()
             except queue.Empty:
                 break
+        self._reset()
+
+    def _prompt(self):
+        """Підказка Whisper: слова, які він має вгадувати (назви з programs.txt)."""
+        names = [n for n in self.hints() if n][:40]
+        return "Орвекс, відкрий, закрий, знайди, запиши. " + (("Програми: " + ", ".join(names) + ".") if names else "")
+
+    def _transcribe(self, audio):
+        segs, _info = self.model.transcribe(
+            audio, language="uk", beam_size=5, temperature=0.0, condition_on_previous_text=False,
+            initial_prompt=self._prompt(), no_speech_threshold=0.6)
+        parts = [x.text.strip() for x in segs if x.no_speech_prob < 0.6 and x.avg_logprob > -1.3]
+        text = " ".join(p for p in parts if p).strip()
+        low = text.lower()
+        return "" if any(h in low for h in self.HALLUCINATIONS) else text
+
+    def _finish(self):
+        loud, seg = self.loud, self.seg
+        self._reset()
+        if loud < 2:                    # коротке клацання, не мова
+            return ""
+        audio = np.concatenate(seg).astype("float32") / 32768.0
+        t0 = time.time()
+        try:
+            text = self._transcribe(audio)
+        except Exception as e:
+            print("Whisper:", e)
+            return ""
+        if time.time() - t0 > 4:
+            print(f"Whisper повільний: {time.time() - t0:.1f} с на фразу (спробуй \"whisper_model\": \"base\")")
+        return text
+
+    def listen(self, timeout=None):
+        """Наступна розпізнана фраза або None, якщо за timeout секунд мови не було."""
+        end = time.time() + timeout if timeout else None
+        while True:
+            if end and time.time() > end and not self.seg:
+                return None
+            try:
+                data = self.q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            a = np.frombuffer(data, dtype="int16")
+            rms = float(np.sqrt(np.mean(a.astype("float32") ** 2))) if len(a) else 0.0
+            if rms > max(400.0, self.floor * 3.0):
+                if not self.seg:
+                    self.seg = list(self.pre)
+                self.seg.append(a)
+                self.loud += 1
+                self.quiet = 0
+            elif self.seg:
+                self.seg.append(a)
+                self.quiet += 1
+            else:
+                self.floor = 0.97 * self.floor + 0.03 * rms
+                self.pre = (self.pre + [a])[-3:]
+                continue
+            if self.quiet >= 3 or len(self.seg) >= 56:          # пауза 0.75 с або 14 с підряд
+                text = self._finish()
+                if text:
+                    return text
 
 
 # --------------------------------------------------------------------------- #
@@ -918,6 +953,7 @@ class Orvex:
         self._prog_cache = (None, {})
         self._init_programs()
         self.raw = ""
+        self.last_unknown = ""   # остання «програма», яку не вдалось знайти (для підказки й навчання)
         self.running = True
         self.pending_confirm = None
         self.lock = threading.RLock()   # голос і телефон не виконують команди одночасно
@@ -1056,12 +1092,66 @@ class Orvex:
             print("programs.txt:", e)
         return self._prog_cache[1]
 
+    @staticmethod
+    def _key(s):
+        """Назва без пробілів і розділових знаків: «пай чарм» == «пайчарм»."""
+        return re.sub(r"[\s'\-]", "", norm(s))
+
+    def _names(self):
+        """{ключ: назва} усіх відомих програм: мій список і автоскан."""
+        return {self._key(n): n for n in [*self.programs(), *map(norm, self._apps_now())]}
+
     def resolve_program(self, name):
         p = self.programs()
         if name in p:
             return p[name]
-        m = difflib.get_close_matches(name, p.keys(), n=1, cutoff=0.8)     # неточне розпізнавання голосу
-        return p[m[0]] if m else None
+        by_key = {self._key(n): n for n in p}
+        k = self._key(name)
+        if k in by_key:
+            return p[by_key[k]]
+        m = difflib.get_close_matches(k, by_key, n=1, cutoff=0.72)         # неточне розпізнавання голосу
+        return p[by_key[m[0]]] if m else None
+
+    def suggest(self, name, n=3):
+        """Схожі назви програм (для підказки, коли почуте не збіглося)."""
+        names = self._names()
+        return [names[k] for k in difflib.get_close_matches(self._key(name), names, n=n, cutoff=0.45)]
+
+    def _add_alias(self, alias, name):
+        """Додає розпізнане на слух слово як ще одну назву програми `name` у programs.txt."""
+        f = FILES["programs"]
+        self._init_programs()
+        lines = f.read_text(encoding="utf-8-sig").splitlines()
+        for i, ln in enumerate(lines):
+            if ln.strip() and not ln.strip().startswith("#") and "=" in ln:
+                names, target = ln.split("=", 1)
+                lst = [n.strip() for n in re.split(r"[,;]", names) if n.strip()]
+                if name in [norm(n) for n in lst]:
+                    if alias not in [norm(n) for n in lst]:
+                        lst.append(alias)
+                    lines[i] = ", ".join(lst) + " =" + target
+                    break
+        else:
+            path = self.resolve_program(name) or self._apps_now().get(name)
+            if not path:
+                return False
+            lines.append(f"{alias}, {name} = {path}")
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self._prog_cache = (None, {})
+        return True
+
+    def _teach_alias(self, alias, spoken):
+        """alias = що почув Orvex, spoken = як це називається насправді (теж може бути почуто криво)."""
+        names = self._names()
+        m = difflib.get_close_matches(self._key(spoken), names, n=1, cutoff=0.6)
+        if not m:
+            return False
+        real = names[m[0]]
+        if self._add_alias(alias, real):
+            self.say(f"Запам'ятав: «{alias}» тепер означає {real}.")
+        else:
+            self.say(f"Не знайшов шлях до «{real}». Спершу додай її: додай програму {real}.")
+        return True
 
     def _save_app(self, name, path):
         f = FILES["programs"]
@@ -1095,6 +1185,17 @@ class Orvex:
         return found
 
     def cmd_apps(self, t):
+        # 0) Orvex почув криво -> «я мав на увазі пайчарм» або «запам'ятай що від і чарром це пайчарм»
+        m = re.match(r"(?:я мав на увазі|мав на увазі|це була програма|я казав) (?:програму )?(.+)", t)
+        if m and self.last_unknown:
+            if self._teach_alias(self.last_unknown, m.group(1).strip()):
+                self.last_unknown = ""
+            else:
+                self.say("Не знаю такої програми. Назви її точніше або додай: додай програму і назву.")
+            return True
+        m = re.match(r"(?:запам'ятай|запамятай|вивчи) (?:що |слово )?(?!команду |цю |поточну |нову )(.+?) (?:це|означає) (.+)", t)
+        if m and self._teach_alias(m.group(1).strip(), m.group(2).strip()):
+            return True
         # 1) відкрив програму сам -> «запам'ятай цю програму як фотошоп»
         m = re.match(r"(?:запам'ятай|запамятай|додай|збережи) (?:цю|поточну|відкриту) (?:програму|прогу|вікно)"
                      r"(?: як| під назвою| називай)? (.+)", t)
@@ -1304,8 +1405,14 @@ class Orvex:
             self.say(f"Запускаю {what}")
             if open_target(exe or name):
                 return True
-        self.say(f"Не знаю, де знаходиться «{what}». Скажи: додай програму {what}, і вибери файл у вікні. "
-                 f"Або відкрий її сам і скажи: запам'ятай цю програму як {what}. Або допиши її у файл: відкрий список програм.")
+        self.last_unknown = what
+        hint = self.suggest(what)
+        if hint:
+            self.say(f"Не знайшов «{what}». Може, ви мали на увазі: {', '.join(hint)}? "
+                     "Скажи: я мав на увазі, і назву. Тоді я запам'ятаю, як ти це вимовляєш.")
+        else:
+            self.say(f"Не знаю, де знаходиться «{what}». Скажи: додай програму {what}, і вибери файл у вікні. "
+                     "Або відкрий її сам і скажи: запам'ятай цю програму як і назву.")
         return True
 
     def _launch(self, name, path):
@@ -1710,7 +1817,7 @@ def run_assistant(holder):
     STATE["mode"] = "thinking"                 # поки вантажиться модель
     orvex = Orvex()
     holder["o"] = orvex
-    listener = Listener(orvex.voice)
+    listener = Listener(orvex.voice, lambda: list(orvex.programs()))
     listener.start()
     try:
         from orvex_remote import start_server
@@ -1747,11 +1854,13 @@ def run_assistant(holder):
                     if nxt is None:
                         STATE["mode"] = "idle"
                         continue
+                    print(f"🎤 {nxt}")
                     command = nxt
             elif in_window:
                 command = text
             else:
-                continue                      # без wake word ігноруємо
+                print("   (пропущено: без слова «Орвекс»)")
+                continue
 
             with orvex.lock:
                 orvex.handle(command)
